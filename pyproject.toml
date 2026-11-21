@@ -1,0 +1,20 @@
+[project]
+name = "photos-mcp"
+version = "0.1.0"
+description = "Read-only Apple Photos connector for Claude (search, locations, route matching, small previews)"
+requires-python = ">=3.12,<3.13"
+# Exact versions on purpose: nothing changes until Christopher approves an update.
+dependencies = [
+  "mcp==2.3.0",
+  "osxphotos==0.78.1",
+]
+
+[project.scripts]
+photos-mcp = "photos_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/photos_mcp"]
