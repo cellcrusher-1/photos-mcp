@@ -98,10 +98,11 @@ def list_albums() -> list[dict]:
 @server.tool()
 def list_people_and_keywords() -> dict:
     """Named people and keywords in the library, with photo counts."""
-    d = lib.db()
-    people = {k: v for k, v in d.persons_as_dict.items() if k and not k.startswith("_")}
-    return {"people": dict(sorted(people.items(), key=lambda kv: -kv[1])),
-            "keywords": dict(sorted(d.keywords_as_dict.items(), key=lambda kv: -kv[1]))}
+    people, keywords = Counter(), Counter()
+    for p in lib.visible_photos():  # counted from visible photos only, so hidden ones never show
+        people.update(x for x in set(p.persons) if x and not x.startswith("_"))
+        keywords.update(set(p.keywords))
+    return {"people": dict(people.most_common()), "keywords": dict(keywords.most_common())}
 
 
 @server.tool()
@@ -153,14 +154,29 @@ def export_previews(uuids: list[str], folder: str, max_px: int = 1024) -> dict:
     for u in uuids:
         try:
             results.append(lib.export_preview(lib.by_uuid(u), folder, px))
-        except ValueError as e:
-            results.append({"uuid": u, "ok": False, "why": str(e)})
+        except Exception as e:  # one bad photo must not lose the rest of the batch
+            results.append({"uuid": u, "ok": False, "why": str(e)[:200]})
     ok = [r for r in results if r.get("ok")]
     return {"folder": str(lib.EXPORT_ROOT / folder), "written": len(ok),
             "bytes": sum(r["bytes"] for r in ok), "results": results}
 
 
+def check() -> int:
+    """`photos-mcp --check`: prove this program can read the library (run from each client)."""
+    try:
+        n = len(lib.visible_photos())
+    except Exception as e:
+        print(f"FAILED: {e}")
+        return 1
+    print(f"OK: read {n} photos and videos from {lib.library_path()}")
+    return 0
+
+
 def main() -> None:
+    import sys
+    if "--check" in sys.argv[1:]:
+        raise SystemExit(check())
+    lib.prewarm()
     server.run("stdio")
 
 

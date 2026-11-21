@@ -27,7 +27,12 @@ built on [osxphotos](https://github.com/RhetTbull/osxphotos). Replaces the third
 
 Runs on the Mac. Search results (dates, places, file names, people names) go to Claude
 as part of the chat. Images leave the Mac only if Claude opens an exported preview or
-you move one somewhere.
+you move one somewhere. Previews keep the photo's metadata, including GPS; strip it
+before publishing a preview anywhere.
+
+Known limits: `album` search may not match shared albums; Claude Code started from a
+terminal may need that terminal app to have Full Disk Access too (`photos-mcp --check`
+tells you).
 
 ## Install / update
 

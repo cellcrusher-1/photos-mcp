@@ -5,8 +5,10 @@ copy when Photos has it open). Hidden photos and Recently Deleted are never retu
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import os
+import sys
 import pathlib
 import re
 import shutil
@@ -16,11 +18,11 @@ import time
 
 DEFAULT_LIBRARY = pathlib.Path.home() / "Pictures" / "Photos Library.photoslibrary"
 EXPORT_ROOT = pathlib.Path.home() / "Pictures" / "Claude Exports"
-RELOAD_AFTER_S = 600  # re-read the library if the copy in memory is older than 10 min
 
 _lock = threading.Lock()
 _db = None
-_loaded_at = 0.0
+_stamp = None
+_visible = None
 
 
 def library_path() -> pathlib.Path:
@@ -28,29 +30,59 @@ def library_path() -> pathlib.Path:
     return pathlib.Path(p).expanduser() if p else DEFAULT_LIBRARY
 
 
+def _db_stamp(lib: pathlib.Path):
+    """Changes whenever Photos writes to its database (main file or write-ahead log)."""
+    out = []
+    for name in ("Photos.sqlite", "Photos.sqlite-wal"):
+        try:
+            st = (lib / "database" / name).stat()
+            out.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
 def db():
-    """The PhotosDB, loaded once and refreshed every 10 minutes."""
-    global _db, _loaded_at
+    """The PhotosDB, loaded once and re-read only when the Photos database has changed."""
+    global _db, _stamp, _visible
     with _lock:
-        if _db is None or time.time() - _loaded_at > RELOAD_AFTER_S:
+        lib = library_path()
+        if not lib.exists():
+            raise RuntimeError(f"Photos library not found at {lib}. Set PHOTOS_MCP_LIBRARY to its path.")
+        stamp = _db_stamp(lib)
+        if _db is None or stamp != _stamp:
             import osxphotos  # imported late so the server starts fast and tests run off-Mac
 
-            lib = library_path()
-            if not lib.exists():
-                raise RuntimeError(f"Photos library not found at {lib}. Set PHOTOS_MCP_LIBRARY to its path.")
             try:
-                _db = osxphotos.PhotosDB(dbfile=str(lib))
+                # Anything osxphotos prints must not reach stdout: that is the MCP channel.
+                with contextlib.redirect_stdout(sys.stderr):
+                    _db = osxphotos.PhotosDB(dbfile=str(lib))
             except PermissionError as e:
                 raise RuntimeError(
                     "macOS blocked reading the Photos library. Give Full Disk Access to this "
                     "connector's Python (see README), then restart the Claude app."
                 ) from e
-            _loaded_at = time.time()
+            _stamp, _visible = stamp, None
         return _db
 
 
 def visible_photos():
-    return [p for p in db().photos(intrash=False) if not p.hidden]
+    """Every photo and video except hidden ones and Recently Deleted (cached with the DB)."""
+    global _visible
+    d = db()
+    if _visible is None:
+        _visible = [p for p in d.photos(intrash=False) if not p.hidden]
+    return _visible
+
+
+def prewarm() -> None:
+    """Load the library in the background at startup so the first search isn't slow."""
+    def run():
+        try:
+            visible_photos()
+        except Exception as e:  # reported again on the first real call
+            print(f"photos-mcp: preload failed: {e}", file=sys.stderr)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def local_naive(d: dt.datetime) -> dt.datetime:
@@ -111,7 +143,8 @@ def full(p) -> dict:
 
 
 def by_uuid(uuid: str):
-    if not re.fullmatch(r"[0-9A-Fa-f-]{8,40}", uuid or ""):
+    uuid = (uuid or "").strip().upper()
+    if not re.fullmatch(r"[0-9A-F][0-9A-F-]{7,39}", uuid):
         raise ValueError("Not a photo id")
     hits = [p for p in db().photos(uuid=[uuid], intrash=False) if not p.hidden]
     if not hits:
@@ -119,20 +152,25 @@ def by_uuid(uuid: str):
     return hits[0]
 
 
-SAFE_FOLDER = re.compile(r"^[A-Za-z0-9 _-]{1,60}$")
+SAFE_FOLDER = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9 _-]{0,59}")
 
 
 def export_preview(p, folder: str, max_px: int) -> dict:
     """Write one JPEG preview (longest side max_px) into ~/Pictures/Claude Exports/<folder>/.
     Uses Photos' own preview when there is one, so iCloud originals aren't downloaded."""
-    if not SAFE_FOLDER.match(folder or ""):
+    if not SAFE_FOLDER.fullmatch(folder or ""):
         raise ValueError("folder may only use letters, numbers, spaces, - and _ (max 60)")
+    if p.ismovie:
+        return {"uuid": p.uuid, "ok": False, "why": "video"}
+    srcs = [s for s in (p.path_derivatives or []) if s and os.path.exists(s)]
+    src = max(srcs, key=os.path.getsize) if srcs else (p.path if p.path and os.path.exists(p.path) else None)
+    if not src:
+        return {"uuid": p.uuid, "ok": False, "why": "not on this Mac (iCloud only)"}
+    root = EXPORT_ROOT.resolve() if EXPORT_ROOT.exists() else EXPORT_ROOT
     dest_dir = EXPORT_ROOT / folder
     dest_dir.mkdir(parents=True, exist_ok=True)
-    srcs = [s for s in (p.path_derivatives or []) if s and os.path.exists(s)]
-    src = srcs[0] if srcs else (p.path if p.path and os.path.exists(p.path) else None)
-    if not src or p.ismovie:
-        return {"uuid": p.uuid, "ok": False, "why": "video" if p.ismovie else "not on this Mac (iCloud only)"}
+    if dest_dir.resolve().parent != root.resolve():
+        raise ValueError("export folder must sit directly inside ~/Pictures/Claude Exports")
     stamp = local_naive(p.date).strftime("%Y%m%d-%H%M%S")
     out = dest_dir / f"{stamp}_{p.uuid[:8]}.jpg"
     sips = shutil.which("sips") or "/usr/bin/sips"

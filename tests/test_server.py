@@ -41,3 +41,15 @@ def test_export_rejects_bad_folder():
     import pytest
     with pytest.raises(ValueError):
         lib.export_preview(PHOTOS[0], "../etc", 800)
+
+def test_folder_name_rules():
+    import pytest
+    for bad in ["abc\n", "..", " x", "a/b", "x" * 61]:
+        with pytest.raises(ValueError):
+            lib.export_preview(PHOTOS[0], bad, 800)
+
+def test_people_counts_skip_hidden():
+    hidden = ph("FFFFFFFF-6", "2026-08-28T17:00:00", persons=["Secret"], hidden=True)
+    lib.visible_photos = lambda: PHOTOS  # hidden photo is not in the visible list
+    r = server.list_people_and_keywords()
+    assert "Secret" not in r["people"] and r["people"]["Jill"] == 5 and "_UNKNOWN_" not in r["people"]
