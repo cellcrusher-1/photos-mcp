@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run the Kitchen album copy every night at 3:07 AM (launchd, your user only).
+# Run the kitchen screen photo copy every night at 3:07 AM (launchd, your user only).
 # Run once, after the main ./install.sh and kitchen_sync.py --setup:
 #   ~/photos-mcp/extras/kitchen_sync/install.sh
 # Undo:  ~/photos-mcp/extras/kitchen_sync/install.sh --remove
@@ -14,7 +14,7 @@ LOG="$HOME/Library/Logs/kitchen-sync.log"
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 if [ "${1:-}" = "--remove" ]; then
   rm -f "$PLIST"
-  echo "Nightly Kitchen copy removed. Photos already on the family page stay until you delete them there."
+  echo "Nightly kitchen photo copy removed. Photos already on the family page stay until you delete them there."
   exit 0
 fi
 [ -x "$PY" ] || { echo "Run the main ./install.sh first ($PY is missing)." >&2; exit 1; }
@@ -38,5 +38,5 @@ cat > "$PLIST" <<PL
 </plist>
 PL
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "Set: the Kitchen album copies every night at 3:07 AM. Log: $LOG"
+echo "Set: a fresh random set of photos goes to the kitchen screen every night at 3:07 AM. Log: $LOG"
 echo "Run it now to test:  launchctl kickstart gui/$(id -u)/$LABEL"

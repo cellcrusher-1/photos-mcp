@@ -22,7 +22,7 @@ built on [osxphotos](https://github.com/RhetTbull/osxphotos). Replaces the third
 - Write anywhere except `~/Pictures/Claude Exports/`.
 - Return hidden photos or Recently Deleted.
 - Make network connections: this code never calls the internet (only the Claude app talks to Anthropic).
-  The optional nightly Kitchen album copy in `extras/kitchen_sync/` is separate and is the one
+  The optional nightly kitchen screen photo copy in `extras/kitchen_sync/` is separate and is the one
   piece that does; see its README.
 
 ## Privacy
