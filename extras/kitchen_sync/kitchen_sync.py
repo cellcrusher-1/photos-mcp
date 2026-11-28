@@ -1,4 +1,4 @@
-"""Copy the "Kitchen" album to the family page's kitchen screen, once a night.
+"""Put a fresh random set of library photos on the family page's kitchen screen, once a night.
 
 This is NOT part of the photos connector. The connector itself still makes no
 network connections; this separate script reuses its read-only library code
@@ -9,10 +9,18 @@ and only to the family page's /sync/kitchen route.
   kitchen_sync.py --check   say what a sync would do, change nothing
   kitchen_sync.py           sync now (launchd runs this each night)
 
-What it sends: a JPEG preview (longest side 2048 px) of each photo in the
-album, named by a one-way hash of the photo's id, never its file name. The
-family page strips GPS, camera, dates and captions from every photo on arrival.
-Videos, hidden photos and photos only in iCloud are skipped and counted.
+Which photos: Christopher chose "Whole library" (Nov 28, 2026), so each night
+it picks NIGHTLY photos at random from the whole library, preferring ones that
+weren't up the night before. It never picks videos, screenshots, hidden or
+deleted photos, photos in shared albums or "Shared with You", photos Photos
+tags as documents, receipts, text or the like, PNG or GIF images, small images
+(saved from the web or messages), or the extra shots of a burst. Leave a whole
+album out by adding its exact name to "skip_albums" in ~/.photos-mcp/kitchen-sync.json,
+for example "skip_albums": ["Work", "Receipts"].
+
+What it sends: a JPEG preview (longest side 2048 px) of each photo, named by
+a one-way hash of the photo's id, never its file name. The family page strips
+GPS, camera, dates and captions from every photo on arrival.
 """
 from __future__ import annotations
 
@@ -21,6 +29,7 @@ import getpass
 import hashlib
 import json
 import pathlib
+import random
 import re
 import shutil
 import ssl
@@ -35,6 +44,18 @@ KEYCHAIN_SERVICE = "family-base-kitchen-sync"
 KEYCHAIN_ACCOUNT = "kitchen"
 WORK_FOLDER = "Kitchen sync"   # under ~/Pictures/Claude Exports, emptied after each run
 MAX_PHOTOS = 500               # the family page keeps at most this many
+NIGHTLY = 300                  # a fresh set this big each night; 300 in and 300 out
+                               # stays inside Cloudflare KV's free daily limits (1,000 each)
+MIN_SIDE = 800                 # smaller images are usually saved from the web or a message
+# Photos' own image tags that mean "paperwork, not a memory". Matched lower case.
+SKIP_LABELS = {
+    "document", "documents", "receipt", "text", "paper", "handwriting", "whiteboard",
+    "blackboard", "diagram", "chart", "menu", "invoice", "letter", "form", "credit card",
+    "id card", "identity card", "passport", "business card", "barcode", "qr code",
+    "screenshot", "x-ray", "x ray", "medical", "prescription", "computer screen",
+    "monitor", "display", "screen",
+}
+SKIP_UTIS = {"public.png", "com.compuserve.gif"}
 MAX_BYTES = 4 * 1024 * 1024    # and refuses anything bigger
 SIZES = (2048, 1600, 1200)     # try smaller if a preview is too big
 HOST_RE = re.compile(r"[a-z0-9.-]+\.[a-z]{2,}")
@@ -60,7 +81,6 @@ def setup() -> int:
     try:
         d = json.loads(base64.b64decode(raw.split(":", 1)[1]))
         host, cid, secret = d["host"], d["client_id"], d["client_secret"]
-        album = d.get("album") or "Kitchen"
     except Exception:
         print("That setup code is damaged. Copy it again, all of it.")
         return 1
@@ -74,7 +94,14 @@ def setup() -> int:
         print("Couldn't save to the Keychain:", r.stderr.strip()[:200])
         return 1
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps({"host": host, "client_id": cid, "album": album}, indent=2) + "\n")
+    old = {}
+    if CONFIG.exists():
+        try:
+            old = json.loads(CONFIG.read_text())
+        except Exception:
+            old = {}
+    CONFIG.write_text(json.dumps({"host": host, "client_id": cid,
+                                  "skip_albums": old.get("skip_albums", [])}, indent=2) + "\n")
     CONFIG.chmod(0o600)
     print(f"Saved. The key is in your Keychain as \"{KEYCHAIN_SERVICE}\".")
     print("Next: run the same line with --check instead of --setup.")
@@ -92,7 +119,8 @@ def load_config():
                        capture_output=True, text=True)
     if r.returncode != 0:
         raise SystemExit("The key isn't in the Keychain (or the Keychain is locked). Run --setup again.")
-    return c["host"], c["client_id"], r.stdout.strip(), c.get("album") or "Kitchen"
+    skip = [a for a in c.get("skip_albums", []) if isinstance(a, str) and a.strip()]
+    return c["host"], c["client_id"], r.stdout.strip(), skip
 
 
 # ---------- talking to the family page ----------
@@ -137,29 +165,63 @@ class Page:
         return {i for i in json.loads(b).get("ids", []) if ID_RE.fullmatch(i)}
 
 
-# ---------- the album ----------
+# ---------- which photos may go up ----------
 
-def album_photos(name):
+def why_not(p, skip_uuids=frozenset()):
+    """The reason a photo stays off the kitchen wall, or None if it may go up."""
+    if p.intrash or p.hidden:
+        return "hidden or deleted"
+    if p.ismovie or not getattr(p, "isphoto", True):
+        return "video"
+    if getattr(p, "screenshot", False) or getattr(p, "screen_recording", False):
+        return "screenshot"
+    if getattr(p, "shared", False) or getattr(p, "syndicated", False) or getattr(p, "shared_moment", False):
+        return "shared with you"
+    if p.uuid in skip_uuids:
+        return "in an album you left out"
+    if getattr(p, "burst", False) and not (getattr(p, "burst_key", False) or getattr(p, "burst_selected", False)):
+        return "extra burst shot"
+    if (getattr(p, "uti", "") or "").lower() in SKIP_UTIS:
+        return "PNG or GIF"
+    w, h = getattr(p, "width", 0) or 0, getattr(p, "height", 0) or 0
+    if w and h and min(w, h) < MIN_SIDE:
+        return "small image"
+    try:
+        labels = {str(x).lower() for x in (p.labels or [])}
+    except Exception:          # Photos hasn't finished analysing this library yet
+        labels = set()
+    if labels & SKIP_LABELS:
+        return "document, receipt or text"
+    return None
+
+
+def library_pool(skip_albums=()):
+    """Every photo that may go up, plus a count of the rest by reason (counts only)."""
     from photos_mcp import library as lib
     d = lib.db()
-    albums = [a for a in d.album_info if (a.title or "") == name]
-    if not albums:
-        raise SystemExit(f'No album called "{name}" in Photos. Make it, add photos, and run again.')
-    seen, out, skipped = set(), [], 0
-    for a in albums:
-        for p in a.photos:
-            if p.uuid in seen:
-                continue
-            seen.add(p.uuid)
-            if p.hidden or p.intrash or p.ismovie:
-                skipped += 1
-                continue
-            out.append(p)
-    out.sort(key=lambda p: p.date, reverse=True)
-    if len(out) > MAX_PHOTOS:
-        skipped += len(out) - MAX_PHOTOS
-        out = out[:MAX_PHOTOS]
-    return out, skipped
+    skip_uuids = set()
+    for a in d.album_info:
+        if (a.title or "") in skip_albums:
+            skip_uuids.update(p.uuid for p in a.photos)
+    pool, why = [], {}
+    for p in d.photos(intrash=False):
+        r = why_not(p, skip_uuids)
+        if r:
+            why[r] = why.get(r, 0) + 1
+        else:
+            pool.append(p)
+    if not pool:
+        raise SystemExit("No photos in the library passed the filters, so nothing was changed.")
+    return pool, why
+
+
+def pick(pool, have, rng=random):
+    """A random order to try: photos not up last night first, then the rest."""
+    fresh = [p for p in pool if photo_id(p.uuid) not in have]
+    old = [p for p in pool if photo_id(p.uuid) in have]
+    rng.shuffle(fresh)
+    rng.shuffle(old)
+    return fresh + old
 
 
 def preview_bytes(p):
@@ -184,41 +246,49 @@ def clean_work_folder():
 # ---------- sync ----------
 
 def sync(check: bool) -> int:
-    host, cid, secret, album = load_config()
-    photos, skipped = album_photos(album)
-    want = {photo_id(p.uuid): p for p in photos}
+    host, cid, secret, skip_albums = load_config()
+    pool, why = library_pool(skip_albums)
     page = Page(host, cid, secret)
     have = page.ids()
-    new = [i for i in want if i not in have]
-    gone = [i for i in have if i not in want]
-    log(f'"{album}": {len(want)} photos, {len(new)} to send, {len(gone)} to take down, {skipped} skipped')
+    n = min(NIGHTLY, MAX_PHOTOS, len(pool))
+    left_off = ", ".join(f"{v} {k}" for k, v in sorted(why.items(), key=lambda kv: -kv[1])) or "none"
+    log(f"Library: {len(pool)} photos may go up; left off: {left_off}")
+    log(f"Tonight: {n} at random, replacing the {len(have)} on the kitchen screen now")
     if check:
         log("Check only: nothing sent.")
         return 0
-    sent = set()
+    keep, skipped = [], 0
     try:
-        for i in new:
-            data, why = preview_bytes(want[i])
+        for p in pick(pool, have):
+            if len(keep) >= n or skipped >= 3 * n:
+                break
+            i = photo_id(p.uuid)
+            if i in have:          # pool ran short of new photos: keep this one up
+                keep.append(i)
+                continue
+            data, reason = preview_bytes(p)
             if data is None:
                 skipped += 1
-                log("skipped one photo:", why)
-                continue
+                continue           # try the next one in the random order
             s, b = page.call("PUT", "/" + i, data, "image/jpeg")
             if s == 200:
-                sent.add(i)
+                keep.append(i)
             else:
                 skipped += 1
                 log(f"the page refused one photo (HTTP {s})")
     finally:
         clean_work_folder()
+    if not keep:
+        log("No photo could be sent tonight, so last night's stay up.")
+        return 1
+    gone = [i for i in have if i not in set(keep)]
     for i in gone:
         page.call("DELETE", "/" + i)
-    keep = [i for i in want if i in have or i in sent]
     s, b = page.call("POST", "/done", json.dumps({"ids": keep, "skipped": skipped}).encode(), "application/json")
     if s != 200:
         log(f"Couldn't save the photo list (HTTP {s}).")
         return 1
-    log(f"Done: {len(sent)} sent, {len(gone)} taken down, {len(keep)} on the kitchen screen.")
+    log(f"Done: {len(keep)} on the kitchen screen, {len(gone)} taken down, {skipped} couldn't be sent.")
     return 0
 
 
